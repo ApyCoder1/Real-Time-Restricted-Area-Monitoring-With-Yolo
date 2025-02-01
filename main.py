@@ -1,158 +1,223 @@
+import streamlit as st
 import cv2
-from time import time
 import numpy as np
-from ultralytics.solutions.solutions import BaseSolution
-from ultralytics.utils.plotting import Annotator, colors
-from datetime import datetime
-import requests
-from paddleocr import PaddleOCR
+from ultralytics import YOLO
+import threading
+import random
 
+video_path = 'v.mp4'
 
-class SpeedEstimator(BaseSolution):
-    def __init__(self, api_url, **kwargs):
-        super().__init__(**kwargs)
-        self.initialize_region()  # Initialize speed region
-        self.spd = {}  # Dictionary to store speed data
-        self.trkd_ids = []  # List for already tracked and speed-estimated IDs
-        self.trk_pt = {}  # Dictionary for previous timestamps
-        self.trk_pp = {}  # Dictionary for previous positions
-        self.logged_ids = set()  # Set to keep track of already logged IDs
+class PPEApp:
+    def __init__(self):
+        self.models = {}
+        self.current_model = None
+        self.cap = None
+        self.alert_played = False
+        self.class_colors = {}
+        self.restricted_area = None  # For defining the restricted region
 
-        # Initialize the OCR system
-        self.ocr = PaddleOCR(use_angle_cls=True, lang='en')
+    def load_models(self, model_paths):
+        """
+        Load multiple YOLO models.
+        """
+        for model_name, path in model_paths.items():
+            self.models[model_name] = YOLO(path)
+        self.current_model = self.models["Intrusion"]  # Set 'Intrusion' as the default model
 
-        # API URL
-        self.api_url = api_url
+    def generate_class_colors(self, model):
+        """
+        Generate a unique random color for each class in the given model.
+        """
+        colors = {}
+        for class_id in model.names:
+            colors[model.names[class_id]] = tuple(
+                random.randint(0, 255) for _ in range(3)
+            )
+        return colors
 
-    def perform_ocr(self, image_array):
-        """Performs OCR on the given image and returns the extracted text."""
-        if image_array is None:
-            raise ValueError("Image is None")
-        if isinstance(image_array, np.ndarray):
-            results = self.ocr.ocr(image_array, rec=True)
-        else:
-            raise TypeError("Input image is not a valid numpy array")
-        return ' '.join([result[1][0] for result in results[0]] if results[0] else "")
+    def start_webcam(self):
+        self.cap = cv2.VideoCapture(0)  # 0 for default
+        if not self.cap.isOpened():
+            st.error("Error: Unable to access the webcam.")
+            return False
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        return True
 
-    def send_to_django_api(self, date, time, track_id, class_name, speed, numberplate):
-        """Send data to the Django API endpoint."""
-        data = {
-            "date": date,
-            "time": time,
-            "track_id": track_id,
-            "class_name": class_name,
-            "speed": speed,
-            "numberplate": numberplate
-        }
+    def stop_webcam(self):
+        if self.cap:
+            self.cap.release()
+            cv2.destroyAllWindows()
+            self.cap = None
+
+    def play_alert_sound(self, sound_path):
         try:
-            response = requests.post(self.api_url, json=data)
-            if response.status_code == 201:
-                print(f"Data sent successfully: {response.json()}")
-            else:
-                print(f"Failed to send data: {response.status_code} - {response.text}")
-        except requests.RequestException as e:
-            print(f"Error sending data to API: {e}")
+            from playsound import playsound
+            playsound(sound_path)
+        except Exception as e:
+            print(f"Error playing sound: {e}")
 
-    def estimate_speed(self, im0):
-        """Estimate speed of objects and track them."""
-        self.annotator = Annotator(im0, line_width=self.line_width)  # Initialize annotator
-        self.extract_tracks(im0)  # Extract tracks
+    def draw_roi(self, frame):
+        """
+        Draw a custom region of interest (ROI) in the shape of an ellipse on the frame.
+        """
+        if self.current_model == self.models["Intrusion"]:  # Check if current model is 'best.pt'
+            height, width, _ = frame.shape
+            center = (width // 2, height // 2)  # Center of the frame
+            axes = (width // 4, height // 8)  # Width and height of the ellipse
+            angle = 0  # No rotation
+            startAngle = 0
+            endAngle = 360
+            color = (0, 0, 255)  # Red color for the ROI
+            thickness = 2
+            self.restricted_area = (center, axes)  # Save the restricted area
+            frame = cv2.ellipse(frame, center, axes, angle, startAngle, endAngle, color, thickness)
+        return frame
 
-        # Get current date and time
-        current_time = datetime.now()
+    def is_near_restricted_area(self, box):
+        """
+        Check if the bounding box of any detected object is near the restricted area.
+        This function checks if any part of the box is near the restricted area (within a distance threshold).
+        """
+        if self.restricted_area:
+            center, axes = self.restricted_area
+            x1, y1, x2, y2 = box
+            object_center = ((x1 + x2) // 2, (y1 + y2) // 2)
+            distance = np.linalg.norm(np.array(center) - np.array(object_center))  # Distance from center
+            return distance < (min(axes) + 50)  # Threshold distance for being "near" the restricted area
+        return False
 
-        for box, track_id, cls in zip(self.boxes, self.track_ids, self.clss):
-            self.store_tracking_history(track_id, box)  # Store track history
+    def update_frame(self, model, confidence_threshold, selected_classes, alert_classes):
+        if not self.cap:
+            return None, []
 
-            if track_id not in self.trk_pt:
-                self.trk_pt[track_id] = 0
-            if track_id not in self.trk_pp:
-                self.trk_pp[track_id] = self.track_line[-1]
+        ret, frame = self.cap.read()
+        if not ret:
+            return None, []
 
-            speed_label = f"{int(self.spd[track_id])} km/h" if track_id in self.spd else self.names[int(cls)]
+        results = model(frame, conf=confidence_threshold, iou=0.3)
+        detected_classes = []
+        annotated_frame = frame.copy()
+        near_restricted_area = False  # Track if any object is near the restricted area
+        alert_triggered_for_current_frame = False  # Flag to avoid repeated alerts in the same frame
 
-            # Draw the bounding box and track ID on it
-            label = f"ID: {track_id} {speed_label}"  # Show track ID along with speed
-            self.annotator.box_label(box, label=label, color=colors(track_id, True))  # Draw bounding box
+        for result in results[0].boxes:
+            class_id = int(result.cls)
+            class_name = model.names[class_id]
 
-            # Speed and direction calculation
-            if self.LineString([self.trk_pp[track_id], self.track_line[-1]]).intersects(self.r_s):
-                direction = "known"
-            else:
-                direction = "unknown"
-
-            # Calculate speed if the direction is known and the object is new
-            if direction == "known" and track_id not in self.trkd_ids:
-                self.trkd_ids.append(track_id)
-                time_difference = time() - self.trk_pt[track_id]
-                if time_difference > 0:
-                    speed = np.abs(self.track_line[-1][1].item() - self.trk_pp[track_id][1].item()) / time_difference
-                    self.spd[track_id] = round(speed)
-
-            # Update the previous tracking time and position
-            self.trk_pt[track_id] = time()
-            self.trk_pp[track_id] = self.track_line[-1]
-            x1, y1, x2, y2 = map(int, box)  # Convert box coordinates to integers
-            cropped_image = np.array(im0)[y1:y2, x1:x2]
-            ocr_text = self.perform_ocr(cropped_image)
-
-            # Get the class name and speed
-            class_name = self.names[int(cls)]
-            speed = self.spd.get(track_id)
-
-            # Ensure OCR text is not empty and send data to the Django API if not already logged
-            if track_id not in self.logged_ids and ocr_text.strip() and speed is not None:
-                self.send_to_django_api(
-                    current_time.strftime("%Y-%m-%d"),
-                    current_time.strftime("%H:%M:%S"),
-                    track_id,
-                    class_name,
-                    speed if speed is not None else 0.0,
-                    ocr_text
+            if class_name in selected_classes:
+                detected_classes.append(class_name)
+                color = self.class_colors.get(class_name, (0, 255, 0))
+                x1, y1, x2, y2 = map(int, result.xyxy[0])
+                conf = result.conf[0]
+                label = f"{class_name} {conf:.2f}"
+                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), color, 3)
+                cv2.putText(
+                    annotated_frame,
+                    label,
+                    (x1, y1 - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2
                 )
-                self.logged_ids.add(track_id)
 
-        self.display_output(im0)  # Display output with base class function
-        return im0
+                # Check if the object is near the restricted area
+                if self.is_near_restricted_area([x1, y1, x2, y2]):
+                    near_restricted_area = True
+                    cv2.putText(annotated_frame, "Object near restricted area!", (50, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
 
+                    # Trigger alert if the detected class is in the alert classes
+                    if class_name in alert_classes and not self.alert_played:
+                        self.alert_played = True
+                        threading.Thread(target=self.play_alert_sound, args=("alert.mp3",), daemon=True).start()
+                        alert_triggered_for_current_frame = True
 
-# Open the video file
-cap = cv2.VideoCapture('v.mp4')
+        # Reset alert if no object is detected in the alert classes
+        if not any(class_name in alert_classes for class_name in detected_classes):
+            self.alert_played = False
 
-# Define region points for counting
-region_points = [(0, 145), (1018, 145)]
+        # Draw ROI if the current model is 'best.pt'
+        annotated_frame = self.draw_roi(annotated_frame)
 
-# Initialize the object counter with the API URL
-api_url = "http://127.0.0.1:8000/speed-records/"  # Replace with your Django API endpoint
-speed_obj = SpeedEstimator(
-    api_url=api_url,
-    region=region_points,
-    model="car.pt",  # Replace with your YOLO model file
-    line_width=2
-)
+        return annotated_frame, detected_classes, near_restricted_area, alert_triggered_for_current_frame
 
-count = 0
+    def run(self):
+        st.set_page_config(page_title="Real-Time Object Monitoring System", layout="wide")
 
-while True:
-    # Read a frame from the video
-    ret, frame = cap.read()
-    if not ret:
-        break
+        st.markdown("<h2>🛡️ Real-Time Restricted Area Monitoring</h2>", unsafe_allow_html=True)
 
-    count += 1
-    if count % 3 != 0:  # Skip odd frames
-        continue
+        st.markdown(
+            "<p style='text-align: center;'>Switch between models and monitor real-time detections.</p>",
+            unsafe_allow_html=True,
+        )
 
-    frame = cv2.resize(frame, (720, 500))
+        st.sidebar.title("🔧 Setting")
+        model_paths = {
+            "Intrusion": "best.pt",
+           
+        }
+        selected_model = st.sidebar.selectbox("Select Model", options=model_paths.keys())
+        if self.current_model != self.models.get(selected_model):
+            self.current_model = self.models[selected_model]
+            self.class_colors = self.generate_class_colors(self.current_model)
 
-    # Process the frame with the object counter
-    result = speed_obj.estimate_speed(frame)
+        confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.4, 0.05)
+        available_classes = list(self.current_model.names.values())
+        selected_classes = st.sidebar.multiselect("Objects to Detect", available_classes, default=[])
 
-    # Show the frame
-    cv2.imshow("RGB", result)
-    if cv2.waitKey(1) & 0xFF == ord("q"):  # Press 'q' to quit
-        break
+        # Update alert_classes options dynamically
+        if selected_classes:
+            alert_classes = st.sidebar.multiselect("Objects for Alert Sound", available_classes, default=[])
+        else:
+            alert_classes = st.sidebar.multiselect("Objects for Alert Sound", ["None"] + available_classes, default=[])
 
-# Release the video capture object and close the display window
-cap.release()
-cv2.destroyAllWindows()
+        if "None" in alert_classes:
+            alert_classes.remove("None")
+
+        start_button = st.sidebar.button("▶️ Start Webcam")
+        stop_button = st.sidebar.button("⏹️ Stop Webcam")
+
+        if start_button:
+            if not self.cap:
+                with st.spinner("Starting the webcam..."):
+                    if self.start_webcam():
+                        st.success("Webcam started successfully!")
+            else:
+                st.warning("Webcam is already running.")
+
+        if stop_button:
+            if self.cap:
+                with st.spinner("Stopping the webcam..."):
+                    self.stop_webcam()
+                    st.success("Webcam stopped.")
+
+        if self.cap:
+            st.subheader("📺 Live Video Feed")
+            frame_placeholder = st.empty()
+            detection_info = st.empty()
+
+            while self.cap.isOpened():
+                result = self.update_frame(self.current_model, confidence_threshold, selected_classes, alert_classes)
+                if result:
+                    frame, detected_classes, near_restricted_area, alert_triggered_for_current_frame = result
+                    if frame is not None:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frame_placeholder.image(frame_rgb, channels="RGB", caption="🔍 Real-time Detection")
+                        detection_info.write(f"Detected Classes: {', '.join(detected_classes) if detected_classes else 'None'}")
+                        if near_restricted_area:
+                            detection_info.write("⚠️ Object near restricted area!")
+
+                        # If the alert was triggered in the current frame, reset alert_played for the next frame
+                        if alert_triggered_for_current_frame:
+                            self.alert_played = False
+
+if __name__ == "__main__":
+    app = PPEApp()
+    app.load_models({
+        "Intrusion": "best.pt",  # Replace with actual paths
+       
+       
+    })
+    app.run()
