@@ -5,8 +5,6 @@ from ultralytics import YOLO
 import threading
 import random
 
-video_path = 'v.mp4'
-
 class PPEApp:
     def __init__(self):
         self.models = {}
