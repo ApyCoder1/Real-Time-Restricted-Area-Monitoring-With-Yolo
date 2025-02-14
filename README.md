@@ -1,4 +1,4 @@
-# Installation Guide for Real-Time Restricted Area Monitoring System
+# Real-Time Restricted Area Monitoring System
 
 ## Prerequisites
 Ensure you have Python 3.12 or later installed. You can check your version using:
